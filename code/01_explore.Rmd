@@ -1,0 +1,231 @@
+---
+title: "explore"
+author: "Hunter York"
+date: "5/24/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+library(data.table)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(quanteda)
+library(topicmodels)
+library(tidytext)
+
+dishes <- fread("../inputs/Dish.csv")
+menu <- fread("../inputs/Menu.csv")
+item <- fread("../inputs/MenuItem.csv")
+page <- fread("../inputs/MenuPage.csv")
+
+begin_date <- "1870-01-01"
+end_date <- "1949-12-31" 
+
+theme_set(theme_bw(base_size = 7))
+```
+
+## Clean up place names where possible and extract US states if mentioned in place names
+
+Step one is to try to see what sort of location data I can get out of this. As I mentioned in my email, these data are not yet geocoded. Below is a table of frequencies of state names in the data. The bulk of the data is not associated with a state. 
+
+I can extract US state names (nothing more granular) for about 5,600/16,000 menus. Even knowing that the currency is in dollars is hard to pin down, as currency data isn't complete for all menus. However, for menus where it explicitly mentions non-US dollars, I drop those cases.
+
+```{r, results='asis'}
+states <- fread("../inputs/states.csv") 
+#menu <- menu[str_sub(place, -5, -1) %like% paste0(states$abbv, collapse = "(?:[^a-zA-Z\b]|$)|(?:^|[^a-zA-Z\b])")]
+menu[, state := str_extract(str_sub(place, -5, -1),
+                            paste0(states$abbv, 
+                                   collapse = "|"))]
+
+# tabulate by state
+menu[,.(.N), by = state] %>% .[order(N, decreasing = T)] %>% 
+  stargazer::stargazer(., title = "Number of Menus by State", summary = F, header = F, font.size = "tiny")
+```
+
+\newpage
+
+## Data artifacts
+
+Seeing as this data is still not finished, I suspect the gaps in temporal coverage are due to the order in which the menus are being digitized (perhaps the catalog is discontinuous in some nonrandom way across time). Regardless, there are some glaring data quality problems, namely large missing gaps across time. 
+
+
+
+```{r}
+# create time graph of menus for first 5 states
+menu[, date_num := as.Date(date)]
+menu <- menu[is.na(currency)|currency == ""|tolower(currency) == "dollars"]
+menu[state %in% c(NA, "NY", "FL", "PA", "IL", "OH")] %>% 
+  .[as.numeric(date_num) > -100000] %>% 
+  ggplot(.) + 
+  geom_jitter(aes(x = date_num, y = state, color = state), shape = 1) +
+  theme_bw() + 
+  xlim(as.Date("1850-01-01"), as.Date("1950-01-01")) + 
+  ggtitle("Data Coverage Across Time: First 5 states and Menus with no State Data")
+```
+
+\newpage
+
+## Do simple price analysis
+
+NB only about half of the menus have prices in this DB. 
+
+As a starting point, I am doing a simple analysis by price of the menus we have. The first step is to assign each menu a median price of all the items on the menu. This serves as an ecological variable for that menu: the average price of items in a restaurant on a given day. These prices are standardized to 2020 USD PPP for comparability's sake. The prices are then split into quintiles so as to assign menus to 5 groups for easier analysis. (1 = low, 5 = high).
+
+Below is a histogram of all prices across all menus by quintile.
+
+```{r}
+# convert to current usd
+usd_xwalk <- readxl::read_excel("../ref/ppp_adj.xlsx", sheet = "Data") %>% data.table()
+# subset to pages in menus
+pages <- page[menu_id %in% menu$id, id]
+items <- item[menu_page_id %in% pages, id]
+item <- merge(item, page[,.(id, menu_id)], by.x = "menu_page_id", by.y = "id")
+item <- merge(item, dishes[,.(id, name)], by.x = "dish_id", by.y = "id")
+item <- merge(item, menu[,.(event, venue, place, state, occasion, date, date_num, id)], by.x = "menu_id", by.y = "id")
+
+item[, year := (substr(date,1,4))]
+item <- merge(item, usd_xwalk, by = "year")
+item[, price := price*as.numeric(value)]
+# item
+item <- item[date_num >= begin_date& date_num <= end_date]
+item[,med_price_menu := median(price, na.rm = T), by = menu_id ]
+item[, decade := as.numeric(substr(date,1,3))*10]
+
+item[, menu_quintile := cut(med_price_menu, breaks = quantile(med_price_menu,probs =  seq(0,1,.2), na.rm = T), labels = 1:5, na.rm = T)]
+
+median_price_per_menu <- item[date_num >= begin_date& date_num <= end_date,.(med_price = median(price, na.rm = T), 
+                                                                             ten_price = quantile(price, .1, na.rm = T),
+                                                                             ninety_price = quantile(price,.9, na.rm = T)), by = .(menu_id, date_num, date, state, event, venue, menu_quintile)]
+cps <- median_price_per_menu[, quantile(med_price, seq(.2,.8, .2), na.rm = T)]
+
+
+ggplot(median_price_per_menu[!is.na(menu_quintile)]) + 
+  geom_histogram(aes(x = log(med_price, base = 10))) + 
+  theme_bw() +
+  facet_wrap(~menu_quintile) +
+  labs(title = "Log Median Price Per Menu Frequency (Range from 1\ndollar to 1384 dollars (2020 PPP), Log(0) = $1)")
+```
+
+
+```{r}
+
+
+print("The cutpoints for the quntiles are:")
+print(cps)
+
+```
+
+\newpage
+
+## Do a topic model by price quintile
+
+This simple analysis uses LDA to create 10 topics across the entire corpus, where each menu is a "document." That is to say that all dishes in a given menu are concatenated into one long "document" which is in turn transformed into a bag of words. Associations between words are calculated using LDA, and the 10 most salient topics are produced. These can then be analyzed across groups and across times to see if any interesting patterns emerge.
+
+```{r}
+# item_cols <- item[(tolower(event) %like% "daily|^dinner$|^lunch$|\\[lunch\\]|\\[dinner\\]" |
+#         tolower(event) == "LUNCH & DINNER") &
+#        (venue == "COMMERCIAL") & occasion == ""] %>%
+  
+item_cols <- item %>%
+  .[!is.na(menu_quintile),.(name, price, med_price_menu, menu_quintile, menu_id)]
+
+items_by_menu <- item_cols[,.(all_items = paste(name, collapse =" ")), by = .(menu_id, menu_quintile, med_price_menu)]
+
+items_tokenized <- tokens(tokenizers::tokenize_words(x = items_by_menu$all_items, strip_numeric = T, lowercase = T, strip_punct = T), padding = T)
+items_tokenized <- tokens_select(items_tokenized, pattern = stopwords("en"), selection = "remove")
+dfm1 <- dfm(items_tokenized)
+
+dfm1 <- dfm_trim(
+    dfm1,
+    min_termfreq = .00005,
+    max_termfreq = .005, termfreq_type = "prop")
+
+
+
+n.topics <- 10
+dfm2topicmodels <- convert(dfm1, to = "topicmodels")
+lda.model <- LDA(dfm2topicmodels, n.topics)
+lda.model
+
+as.data.frame(terms(lda.model, 10)) %>% 
+  data.table() %>% 
+  .[, id := 1:nrow(.)] %>% 
+  melt(id.var = "id") %>% 
+  .[,.(paste0(paste0(value[1:(length(value)/2)], collapse = ", "),
+       "\n",
+       paste0(value[((length(value)/2)+1):length(value)], collapse = ", "))), by = "variable"] -> legend_vals
+
+
+
+items_by_menu[, topics := topics(lda.model)]
+items_by_menu[,(.N), by = .(topics, menu_quintile)] %>%
+  .[, N := V1/sum(V1), by = menu_quintile] %>%
+  ggplot(.) +
+  geom_bar(aes(x = as.factor(menu_quintile),
+             y = N,
+             fill = as.factor(topics)),
+         position = "stack",
+         stat = "identity")+
+    scale_fill_manual(labels = legend_vals$V1, values = rainbow(10))
+
+```
+
+```{r, results='asis'}
+stargazer::stargazer(as.data.frame(terms(lda.model, 20)), 
+                     header = F, summary = F, title = "Topics",font.size = "tiny")
+```
+
+\newpage
+
+## Repeat analysis across time
+
+As I mentioned in my email, I'm afraid all the old menus are biased towards very fancy restaurants, making this a pretty useless analysis (champagne in first quintile restaurants?). Still a fun exercise. Nice to see prohibition did in fact reduce alcohol in menus, so at least the model is working at its most basic level.
+
+
+```{r}
+items_by_menu <- merge(items_by_menu, menu[,.(id, date)], by.x = "menu_id", by.y = "id")
+
+
+items_by_menu%>% 
+  .[, date_round := as.Date(paste0(substr(as.character(date), 1,3),"0-", 
+                                   #round(as.numeric(substr(as.character(date), 6,7))/6)*6,
+                                   "01",
+                                   "-01"), "%Y-%m-%d")] %>% 
+  .[,(.N), by = .(topics, menu_quintile, date_round)]  %>% 
+  .[,N := V1/sum(V1), by = .(menu_quintile, date_round)] %>% 
+  ggplot(.) +
+  geom_bar(aes(x = date_round,
+             y = N,
+             fill = as.factor(topics)),
+            # group  = as.factor(topics)),
+            position = "stack",
+           stat = "identity") + 
+  facet_wrap(~menu_quintile) +
+  xlim(as.Date(begin_date) - (365*5), as.Date(end_date) + (365*5)) +
+  scale_fill_manual(labels = legend_vals$V1, values = rainbow(10))+
+    ggtitle("Topics Across Time By Quintile")
+
+
+
+items_by_menu%>% 
+  .[, date_round := as.Date(paste0(substr(as.character(date), 1,3),"0-", 
+                                   #round(as.numeric(substr(as.character(date), 6,7))/6)*6,
+                                   "01",
+                                   "-01"), "%Y-%m-%d")] %>% 
+  .[,(.N), by = .(topics, menu_quintile, date_round)]  %>% 
+  .[,N := V1/sum(V1), by = .(menu_quintile, date_round)] %>% 
+  ggplot(.) +
+  geom_bar(aes(x = date_round,
+             y = N,
+             fill = as.factor(topics)),
+            # group  = as.factor(topics)),
+            position = "stack",
+           stat = "identity") + 
+  facet_wrap(~menu_quintile) +
+  xlim(as.Date(begin_date) - (365*5), as.Date(end_date) + (365*5)) +
+  scale_fill_manual(labels = legend_vals$V1, values = rainbow(10))+
+    ggtitle("Topics Across Time Not By Quintile")
+
+```
